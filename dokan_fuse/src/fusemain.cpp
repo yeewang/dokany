@@ -440,6 +440,8 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
                                          DWORD creation_disposition,
                                          DWORD flags_and_attributes,
                                          PDOKAN_FILE_INFO dokan_file_info) {
+  impl_file_handle *oldHndl =
+     		reinterpret_cast<impl_file_handle *>(dokan_file_info->Context);
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
   dokan_file_info->Context = 0;
 
@@ -479,9 +481,10 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
                               access_mode, dokan_file_info);
       } else if (creation_disposition == FILE_SUPERSEDE ||
                  creation_disposition == FILE_OVERWRITE_IF) {
-        if (!ops_.truncate)
-          return -EINVAL;
-        CHECKED(ops_.truncate(fname.c_str(), 0));
+  		if (oldHndl && ops_.ftruncate) {
+    		fuse_file_info finfo(oldHndl->make_finfo());
+    		CHECKED(ops_.ftruncate(oldHndl->get_name().c_str(), 0, &finfo));
+  		}
       } else if (creation_disposition == FILE_CREATE) {
         SetLastError(ERROR_FILE_EXISTS);
         return win_error(STATUS_OBJECT_NAME_COLLISION, true);
@@ -767,9 +770,7 @@ int impl_fuse_context::set_end_of_file(LPCWSTR file_name, LONGLONG byte_offset,
     return ops_.ftruncate(hndl->get_name().c_str(), off, &finfo);
   }
 
-  if (!ops_.truncate)
-    return -EINVAL;
-  return ops_.truncate(fname.c_str(), off);
+  return -EINVAL;
 }
 
 int impl_fuse_context::set_file_attributes(LPCWSTR file_name,
