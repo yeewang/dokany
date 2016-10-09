@@ -1,20 +1,25 @@
 #define WIN32_NO_STATUS
 #include <windows.h>
 #undef WIN32_NO_STATUS
-#include <ntstatus.h>
 #include <errno.h>
-#include <sys/utime.h>
-#include <sys/stat.h>
+#include <limits.h>
+#include <ntstatus.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
+#include <sys/stat.h>
+#include <sys/utime.h>
 #ifndef _MSC_VER
 #include <unistd.h>
 #endif
 #include <map>
 
+#include <mutex>
+#include <set>
+
 #include "fusemain.h"
 #include "utils.h"
+
+#include "fuse_debug.h"
 
 #ifndef S_ISLNK
 #define S_ISLNK(mode) __S_ISTYPE((mode), __S_IFLNK)
@@ -31,6 +36,9 @@
   (GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | FILE_APPEND_DATA |                \
    FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | FILE_WRITE_EA | FILE_ADD_FILE |   \
    FILE_ADD_SUBDIRECTORY | FILE_APPEND_DATA)
+
+static std::set<std::pair<std::string, int>> delete_on_close;
+static std::mutex delete_on_close_mutex;
 
 ///////////////////////////////////////////////////////////////////////////////////////
 ////// FUSE frames chain
@@ -146,9 +154,9 @@ int impl_fuse_context::do_open_file(LPCWSTR FileName, DWORD share_mode,
   return 0;
 }
 
-int impl_fuse_context::do_delete_directory(LPCWSTR file_name,
+int impl_fuse_context::do_delete_directory(const std::string & file_name,
                                            PDOKAN_FILE_INFO dokan_file_info) {
-  std::string fname = unixify(wchar_to_utf8_cstr(file_name));
+  const std::string fname = file_name;
 
   if (!ops_.rmdir || !ops_.getattr)
     return -EINVAL;
@@ -171,14 +179,12 @@ int impl_fuse_context::do_delete_directory(LPCWSTR file_name,
   return ops_.rmdir(fname.c_str());
 }
 
-int impl_fuse_context::do_delete_file(LPCWSTR file_name,
+int impl_fuse_context::do_delete_file(const std::string & file_name,
                                       PDOKAN_FILE_INFO dokan_file_info) {
   if (!ops_.unlink)
     return -EINVAL;
 
-  // Note: we do not try to resolve symlink target
-  std::string fname = unixify(wchar_to_utf8_cstr(file_name));
-  return ops_.unlink(fname.c_str());
+  return ops_.unlink(file_name.c_str());
 }
 
 int impl_fuse_context::do_create_file(LPCWSTR FileName, DWORD Disposition,
@@ -268,6 +274,7 @@ int impl_fuse_context::walk_directory(void *buf, const char *name,
                                       FUSE_OFF_T off) {
   walk_data *wd = static_cast<walk_data *>(buf);
   WIN32_FIND_DATAW find_data = {0};
+  std::string fullname = wd->dirname + name;
 
   utf8_to_wchar_buf(name, find_data.cFileName, MAX_PATH);
   // fix name if wrong encoding
@@ -283,21 +290,62 @@ int impl_fuse_context::walk_directory(void *buf, const char *name,
 
   struct FUSE_STAT stat = {0};
 
-  /* if (stbuf != NULL)
-    stat = *stbuf;
-  else { */
-    // stat (*stbuf) has only st_ino and st_mode -> request other info with getattr
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) // Special entries
-      stat.st_mode |= S_IFDIR; // TODO: fill directory params here!!!
-    else
-      CHECKED(wd->ctx->ops_.getattr((wd->dirname + name).c_str(), &stat));
-  //}
+  // stat (*stbuf) has only st_ino and st_mode -> request other info with
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) // Special entries
+    stat.st_mode |= S_IFDIR; // TODO: fill directory params here!!!
+  else {
+    CHECKED(wd->ctx->ops_.getattr(fullname.c_str(), &stat));
+
+	  // Save the file name for to speedy-up the delete processing.
+	  {
+	  	std::lock_guard<std::mutex> lk(delete_on_close_mutex);
+	    int isDir = ((stat.st_mode & S_IFDIR) == S_IFDIR);
+	  	delete_on_close.insert(std::pair<std::string, int>(fullname, isDir));
+	  }
+  }
 
   if (S_ISLNK(stat.st_mode)) {
     std::string resolved;
-    CHECKED(wd->ctx->resolve_symlink(wd->dirname + name, &resolved));
+    CHECKED(wd->ctx->resolve_symlink(fullname, &resolved));
     CHECKED(wd->ctx->ops_.getattr(resolved.c_str(), &stat));
   }
+
+  convertStatlikeBuf(&stat, name, &find_data);
+
+  uint32_t attrs = 0xFFFFFFFFu;
+  if (wd->ctx->ops_.win_get_attributes)
+    attrs = wd->ctx->ops_.win_get_attributes(fullname.c_str());
+  if (attrs != 0xFFFFFFFFu)
+    find_data.dwFileAttributes = attrs;
+
+  return wd->delegate(&find_data, wd->DokanFileInfo);
+}
+
+int impl_fuse_context::walk_delete_directory(void *buf, const char *name,
+                                       const struct FUSE_STAT *stbuf,
+                                       FUSE_OFF_T off) {
+  walk_data *wd = static_cast<walk_data *>(buf);
+  WIN32_FIND_DATAW find_data = {0};
+
+  utf8_to_wchar_buf(name, find_data.cFileName, MAX_PATH);
+  // fix name if wrong encoding
+  if (!find_data.cFileName[0]) {
+    struct FUSE_STAT stbuf = {0};
+    utf8_to_wchar_buf_old(name, find_data.cFileName, MAX_PATH);
+    std::string new_name = wchar_to_utf8_cstr(find_data.cFileName);
+    if (wd->ctx->ops_.getattr && wd->ctx->ops_.rename && new_name.length() &&
+        wd->ctx->ops_.getattr(new_name.c_str(), &stbuf) == -ENOENT)
+      wd->ctx->ops_.rename(name, new_name.c_str());
+  }
+  memset(find_data.cAlternateFileName, 0, sizeof(find_data.cAlternateFileName));
+
+  struct FUSE_STAT stat = {0};
+  FPRINTF(stderr, "dddddddddddddddddd: %s, %s\n\n", wd->dirname.c_str(), name);
+
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+    return 0;
+  else
+    CHECKED(wd->ctx->ops_.getattr((wd->dirname + name).c_str(), &stat));
 
   convertStatlikeBuf(&stat, name, &find_data);
 
@@ -307,14 +355,14 @@ int impl_fuse_context::walk_directory(void *buf, const char *name,
   if (attrs != 0xFFFFFFFFu)
     find_data.dwFileAttributes = attrs;
 
-  return wd->delegate(&find_data, wd->DokanFileInfo);
+  return delete_directory_recursive2(wd->dirname + name, wd->DokanFileInfo);
 }
 
 int impl_fuse_context::walk_directory_getdir(fuse_dirh_t hndl, const char *name,
                                              int type, ino_t ino) {
   walk_data *wd = (walk_data *)hndl;
   wd->getdir_data.push_back(name); // Add this name to list
-  return 0; // Get more entries
+  return 0;                        // Get more entries
 }
 
 int impl_fuse_context::find_files(LPCWSTR file_name,
@@ -325,6 +373,12 @@ int impl_fuse_context::find_files(LPCWSTR file_name,
 
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
   CHECKED(check_and_resolve(&fname));
+
+  // Save the file name for to speedy-up the delete processing.
+  {
+  	std::lock_guard<std::mutex> lk(delete_on_close_mutex);
+  	delete_on_close.insert(std::pair<std::string, int>(fname, 1));
+  }
 
   walk_data wd;
   wd.ctx = this;
@@ -383,11 +437,63 @@ int impl_fuse_context::open_directory(LPCWSTR file_name,
     return -ENOTDIR;
 
   dokan_file_info->Context = (ULONG64)NULL; // Do not want to attach anything
-  return 0; // Use readdir here?
+  return 0;                                 // Use readdir here?
 }
 
-int impl_fuse_context::cleanup(LPCWSTR file_name,
+int impl_fuse_context::delete_directory_recursive(
+    const std::string &file_name, PDOKAN_FILE_INFO dokan_file_info) {
+  impl_fuse_context *impl = FuseContext(dokan_file_info);
+
+  FPRINTF(stderr, "delete_directory_recursive: %s\n\n", file_name.c_str());
+
+  if (dokan_file_info->IsDirectory) {
+    impl->find_files_delete(file_name, dokan_file_info);
+
+    impl->do_delete_directory(file_name, dokan_file_info);
+  } else {
+    impl->close_file(file_name, dokan_file_info);
+
+    impl->do_delete_file(file_name, dokan_file_info);
+  }
+
+  return 0;
+}
+
+int impl_fuse_context::delete_directory_recursive2(
+    const std::string &dirname, PDOKAN_FILE_INFO dokan_file_info) {
+    impl_fuse_context *impl = FuseContext(dokan_file_info);
+	return impl->delete_directory_recursive(
+		dirname, dokan_file_info);
+}
+
+int impl_fuse_context::find_files_delete(const std::string &file_name,
+                                         PDOKAN_FILE_INFO dokan_file_info) {
+  walk_data wd;
+  wd.ctx = this;
+  wd.dirname = file_name;
+  if (*file_name.rbegin() != '/')
+    wd.dirname.append("/");
+  wd.DokanFileInfo = dokan_file_info;
+
+  FPRINTF(stderr, "RRRRRRRRRRRRRRRR find_files_delete: %s\n", file_name.c_str());
+
+  if (ops_.readdir) {
+    impl_file_handle *hndl =
+        reinterpret_cast<impl_file_handle *>(dokan_file_info->Context);
+
+    if (hndl != NULL) {
+      fuse_file_info finfo(hndl->make_finfo());
+      return ops_.readdir(file_name.c_str(), &wd, &walk_delete_directory, 0, &finfo);
+    } else
+      return ops_.readdir(file_name.c_str(), &wd, &walk_delete_directory, 0, NULL);
+  }
+
+  return 0;
+}
+
+int impl_fuse_context::cleanup(const std::string & file_name,
                                PDOKAN_FILE_INFO dokan_file_info) {
+#if 0
   // TODO:
   // There's a subtle race condition possible here. 'Cleanup' is called when the
   // system closes the last handle from user space. However, there might still
@@ -399,8 +505,8 @@ int impl_fuse_context::cleanup(LPCWSTR file_name,
   // and block until the file is closed. We're not doing this yet.
 
   // No context for directories when ops_.opendir is not set
-  if (dokan_file_info->Context
-    || (dokan_file_info->IsDirectory && !ops_.opendir)) {
+  if (dokan_file_info->Context ||
+      (dokan_file_info->IsDirectory && !ops_.opendir)) {
     if (dokan_file_info->DeleteOnClose) {
       close_file(file_name, dokan_file_info);
       if (dokan_file_info->IsDirectory) {
@@ -409,6 +515,40 @@ int impl_fuse_context::cleanup(LPCWSTR file_name,
         do_delete_file(file_name, dokan_file_info);
       }
     }
+  }
+#endif
+
+  std::set<std::pair<std::string, int>>::reverse_iterator iter, next;
+  std::lock_guard<std::mutex> lk(delete_on_close_mutex);
+
+  close_file(file_name, dokan_file_info);
+
+  for (iter = delete_on_close.rbegin(); iter != delete_on_close.rend(); ++iter) {
+	  const std::string &filename = (*iter).first;
+
+	  if (debug())
+		  FPRINTF(stderr, "delete_on_close: %s, DeleteOnClose: %d\n", filename.c_str(),
+					  dokan_file_info->DeleteOnClose);
+
+	  if (filename.compare(0, file_name.size(), file_name) == 0) {
+		  if (filename.size() > file_name.size()) {
+			  if (filename[file_name.size()] != '/')
+				  continue;
+		  }
+
+		  if (debug())
+			  FPRINTF(stderr, "Delete the %s: %s\n",
+					  (*iter).second ? "directory" : "file", filename.c_str());
+
+		  if ((*iter).second) {
+			  do_delete_directory(filename, dokan_file_info);
+		  } else {
+			  do_delete_file(filename, dokan_file_info);
+		  }
+
+		  delete_on_close.erase(std::next(iter).base());
+		  --iter;
+	  }
   }
 
   return 0;
@@ -426,13 +566,13 @@ int impl_fuse_context::create_directory(LPCWSTR file_name,
 
 int impl_fuse_context::delete_directory(LPCWSTR file_name,
                                         PDOKAN_FILE_INFO dokan_file_info) {
+  impl_fuse_context *impl = FuseContext(dokan_file_info);
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
 
-  if (!ops_.getattr)
-    return -EINVAL;
+  if (impl->debug())
+    FPRINTF(stderr, "delete_directory: %ls\n", file_name);
 
-  struct FUSE_STAT stbuf = {0};
-  return ops_.getattr(fname.c_str(), &stbuf);
+  return 0;
 }
 
 win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
@@ -441,7 +581,7 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
                                          DWORD flags_and_attributes,
                                          PDOKAN_FILE_INFO dokan_file_info) {
   impl_file_handle *oldHndl =
-     		reinterpret_cast<impl_file_handle *>(dokan_file_info->Context);
+      reinterpret_cast<impl_file_handle *>(dokan_file_info->Context);
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
   dokan_file_info->Context = 0;
 
@@ -481,10 +621,10 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
                               access_mode, dokan_file_info);
       } else if (creation_disposition == FILE_SUPERSEDE ||
                  creation_disposition == FILE_OVERWRITE_IF) {
-  		if (oldHndl && ops_.ftruncate) {
-    		fuse_file_info finfo(oldHndl->make_finfo());
-    		CHECKED(ops_.ftruncate(oldHndl->get_name().c_str(), 0, &finfo));
-  		}
+        if (oldHndl && ops_.ftruncate) {
+          fuse_file_info finfo(oldHndl->make_finfo());
+          CHECKED(ops_.ftruncate(oldHndl->get_name().c_str(), 0, &finfo));
+        }
       } else if (creation_disposition == FILE_CREATE) {
         SetLastError(ERROR_FILE_EXISTS);
         return win_error(STATUS_OBJECT_NAME_COLLISION, true);
@@ -492,7 +632,7 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
 
       if (creation_disposition == FILE_OVERWRITE_IF ||
           creation_disposition == FILE_OPEN_IF) {
-          SetLastError(ERROR_ALREADY_EXISTS);
+        SetLastError(ERROR_ALREADY_EXISTS);
       }
 
       return do_open_file(file_name, share_mode, access_mode, dokan_file_info);
@@ -500,7 +640,7 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
   }
 }
 
-int impl_fuse_context::close_file(LPCWSTR file_name,
+int impl_fuse_context::close_file(const std::string & file_name,
                                   PDOKAN_FILE_INFO dokan_file_info) {
   impl_file_handle *hndl =
       reinterpret_cast<impl_file_handle *>(dokan_file_info->Context);
@@ -627,8 +767,10 @@ int impl_fuse_context::flush_file_buffers(LPCWSTR /*file_name*/,
 }
 
 int impl_fuse_context::get_file_information(
-    LPCWSTR file_name, LPBY_HANDLE_FILE_INFORMATION handle_file_information,
-    PDOKAN_FILE_INFO dokan_file_info) {
+    LPCWSTR file_name,
+    LPBY_HANDLE_FILE_INFORMATION handle_file_information,
+    PDOKAN_FILE_INFO dokan_file_info,
+    struct FUSE_STAT *originalStat) {
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
 
   if (!ops_.getattr)
@@ -636,6 +778,10 @@ int impl_fuse_context::get_file_information(
 
   struct FUSE_STAT st = {0};
   CHECKED(ops_.getattr(fname.c_str(), &st));
+
+  if (originalStat)
+  	*originalStat = st;
+
   if (S_ISLNK(st.st_mode)) {
     std::string resolved;
     CHECKED(resolve_symlink(fname, &resolved));
@@ -658,13 +804,13 @@ int impl_fuse_context::get_file_information(
 
 int impl_fuse_context::delete_file(LPCWSTR file_name,
                                    PDOKAN_FILE_INFO dokan_file_info) {
+  impl_fuse_context *impl = FuseContext(dokan_file_info);
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
 
-  if (!ops_.getattr)
-    return -EINVAL;
+  if (impl->debug())
+    FPRINTF(stderr, "delete_file: %ls\n", file_name);
 
-  struct FUSE_STAT stbuf = {0};
-  return ops_.getattr(fname.c_str(), &stbuf);
+  return 0;
 }
 
 int impl_fuse_context::move_file(LPCWSTR file_name, LPCWSTR new_file_name,
@@ -912,9 +1058,7 @@ int impl_fuse_context::get_volume_information(LPWSTR volume_name_buffer,
   return 0;
 }
 
-int impl_fuse_context::mounted(PDOKAN_FILE_INFO DokanFileInfo) {
-	return 0;
-}
+int impl_fuse_context::mounted(PDOKAN_FILE_INFO DokanFileInfo) { return 0; }
 
 int impl_fuse_context::unmounted(PDOKAN_FILE_INFO DokanFileInfo) {
   if (ops_.destroy)
@@ -1096,28 +1240,32 @@ int impl_file_lock::unlock_file(impl_file_handle *file, long long start,
 ////// File handle
 ///////////////////////////////////////////////////////////////////////////////////////
 impl_file_handle::impl_file_handle(bool is_dir, DWORD shared_mode)
-    : is_dir_(is_dir), fh_(-1), next_file(NULL), file_lock(NULL), shared_mode_(shared_mode) {}
+    : is_dir_(is_dir), fh_(-1), next_file(NULL), file_lock(NULL),
+      shared_mode_(shared_mode) {}
 
 impl_file_handle::~impl_file_handle() { file_lock->remove_file(this); }
 
 int impl_file_handle::close(const struct fuse_operations *ops) {
   int flush_err = 0;
-  if (is_dir_) {
-    if (ops->releasedir) {
-      fuse_file_info finfo(make_finfo());
-      ops->releasedir(get_name().c_str(), &finfo);
-    }
-  } else {
-    if (ops->flush) {
-      fuse_file_info finfo(make_finfo());
-      finfo.flush = 1;
-      flush_err = ops->flush(get_name().c_str(), &finfo);
-    }
-    if (ops->release) // Ignoring result.
-    {
-      fuse_file_info finfo(make_finfo());
-      ops->release(get_name().c_str(), &finfo); // Set open() flags here?
-    }
+
+  if (file_lock) {
+	  if (is_dir_) {
+	    if (ops->releasedir) {
+	      fuse_file_info finfo(make_finfo());
+	      ops->releasedir(get_name().c_str(), &finfo);
+	    }
+	  } else {
+	    if (ops->flush) {
+	      fuse_file_info finfo(make_finfo());
+	      finfo.flush = 1;
+	      flush_err = ops->flush(get_name().c_str(), &finfo);
+	    }
+	    if (ops->release) // Ignoring result.
+	    {
+	      fuse_file_info finfo(make_finfo());
+	      ops->release(get_name().c_str(), &finfo); // Set open() flags here?
+	    }
+	  }
   }
   return flush_err;
 }

@@ -8,15 +8,7 @@
 #include "../../dokan/dokani.h"
 #include <stdio.h>
 
-#if defined(__GNUC__)
-#define FPRINTF(f, args...)                                                   \
-  do {                                                                         \
-    fprintf(f, args);                                                         \
-    fflush(f);                                                                 \
-  } while (0)
-#else
-#define FPRINTF fprintf
-#endif
+#include "fuse_debug.h"
 
 #define the_impl                                                               \
   reinterpret_cast<impl_fuse_context *>(                                       \
@@ -31,6 +23,11 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason,
     DisableThreadLibraryCalls(hInstance);
   }
   return TRUE;
+}
+
+impl_fuse_context *FuseContext(PDOKAN_FILE_INFO DokanFileInfo) {
+  return reinterpret_cast<impl_fuse_context *>(
+      DokanFileInfo->DokanOptions->GlobalContext);
 }
 
 static NTSTATUS DOKAN_CALLBACK
@@ -50,17 +47,21 @@ static void DOKAN_CALLBACK FuseCleanup(LPCWSTR FileName,
                                        PDOKAN_FILE_INFO DokanFileInfo) {
   impl_fuse_context *impl = the_impl;
   if (impl->debug())
-	  FPRINTF(stderr, "Cleanup: %ls\n\n", FileName);
+    FPRINTF(stderr, "Cleanup: %ls, DeleteOnClose: %d\n\n", FileName,
+            DokanFileInfo->DeleteOnClose);
 
-  impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
-  impl->cleanup(FileName, DokanFileInfo);
+  if (DokanFileInfo->DeleteOnClose) {
+  	std::string fname = unixify(wchar_to_utf8_cstr(FileName));
+  	impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
+	impl->cleanup(fname, DokanFileInfo);
+  }
 }
 
 static NTSTATUS DOKAN_CALLBACK
 FuseDeleteDirectory(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
   impl_fuse_context *impl = the_impl;
   if (impl->debug())
-	  FPRINTF(stderr, "DeleteDirectory: %ls\n", FileName);
+    FPRINTF(stderr, "DeleteDirectory: %ls\n", FileName);
 
   impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
   return errno_to_ntstatus_error(
@@ -132,8 +133,8 @@ CONST_END(cDisposition)
 void DebugConstant(const char *name, ULONG value, Constant *c) {
   while (c->name != NULL && c->value != value)
     ++c;
-  fprintf(stderr, "%s: %s (" PRIxULONG ")\n", name, c->name ? c->name : "unknown!",
-          value);
+  fprintf(stderr, "%s: %s (" PRIxULONG ")\n", name,
+          c->name ? c->name : "unknown!", value);
 }
 
 void DebugConstantBit(const char *name, DWORD value, Constant *cs) {
@@ -176,9 +177,10 @@ FuseCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
     DebugConstantBit("\tDesiredAccess", DesiredAccess, cAccessMode);
     DebugConstantBit("\tShareAccess", ShareAccess, cShareMode);
     DebugConstant("\tDisposition", CreateDisposition, cDisposition);
-    FPRINTF(stderr, "\tAttributes: " PRIuULONG " (0x" PRIxULONG ")\n", FileAttributes,
-             FileAttributes);
-    FPRINTF(stderr, "\tOptions: " PRIuULONG " (0x" PRIxULONG ")\n", CreateOptions, CreateOptions);
+    FPRINTF(stderr, "\tAttributes: " PRIuULONG " (0x" PRIxULONG ")\n",
+            FileAttributes, FileAttributes);
+    FPRINTF(stderr, "\tOptions: " PRIuULONG " (0x" PRIxULONG ")\n",
+            CreateOptions, CreateOptions);
     fflush(stderr);
   }
 
@@ -197,8 +199,7 @@ FuseCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
   }
 
   return impl->create_file(FileName, DesiredAccess, ShareAccess,
-                           CreateDisposition, FileAttributes,
-                           DokanFileInfo);
+                           CreateDisposition, FileAttributes, DokanFileInfo);
 }
 
 static void DOKAN_CALLBACK FuseCloseFile(LPCWSTR FileName,
@@ -208,7 +209,9 @@ static void DOKAN_CALLBACK FuseCloseFile(LPCWSTR FileName,
     FPRINTF(stderr, "Close: %ls\n\n", FileName);
 
   impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
-  impl->close_file(FileName, DokanFileInfo);
+  std::string fname = unixify(wchar_to_utf8_cstr(FileName));
+
+  impl->close_file(fname, DokanFileInfo);
 }
 
 static NTSTATUS DOKAN_CALLBACK FuseReadFile(LPCWSTR FileName, LPVOID Buffer,
@@ -218,7 +221,7 @@ static NTSTATUS DOKAN_CALLBACK FuseReadFile(LPCWSTR FileName, LPVOID Buffer,
   impl_fuse_context *impl = the_impl;
   if (impl->debug())
     FPRINTF(stderr, "ReadFile: %ls from %lld len %u\n", FileName,
-             (__int64)Offset, (unsigned)BufferLength);
+            (__int64)Offset, (unsigned)BufferLength);
 
   impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
   return errno_to_ntstatus_error(impl->read_file(
@@ -232,8 +235,8 @@ static NTSTATUS DOKAN_CALLBACK FuseWriteFile(LPCWSTR FileName, LPCVOID Buffer,
                                              PDOKAN_FILE_INFO DokanFileInfo) {
   impl_fuse_context *impl = the_impl;
   if (impl->debug())
-    FPRINTF(stderr, "WriteFile: %ls, offset %lld, length " PRIuDWORD "\n", FileName,
-             Offset, NumberOfBytesToWrite);
+    FPRINTF(stderr, "WriteFile: %ls, offset %lld, length " PRIuDWORD "\n",
+            FileName, Offset, NumberOfBytesToWrite);
 
   impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
   return errno_to_ntstatus_error(
@@ -255,13 +258,34 @@ FuseFlushFileBuffers(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
 static NTSTATUS DOKAN_CALLBACK FuseGetFileInformation(
     LPCWSTR FileName, LPBY_HANDLE_FILE_INFORMATION HandleFileInformation,
     PDOKAN_FILE_INFO DokanFileInfo) {
+  static time_t lastTime = -1;
+  static WCHAR lastName[MAX_PATH] = L"";
+  static LPBY_HANDLE_FILE_INFORMATION lastInfo =
+      (LPBY_HANDLE_FILE_INFORMATION)malloc(sizeof(*HandleFileInformation));
+  static NTSTATUS lastErr = 0;
+  time_t now;
+  struct FUSE_STAT originalStat;
+
   impl_fuse_context *impl = the_impl;
   if (impl->debug())
     FPRINTF(stderr, "GetFileInfo: : %ls\n", FileName);
 
+  time(&now);
+  if (now - lastTime < 5 && wcsncmp(FileName, lastName, MAX_PATH) == 0) {
+    memcpy(HandleFileInformation, lastInfo, sizeof(*HandleFileInformation));
+    return lastErr;
+  }
+
   impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
-  return errno_to_ntstatus_error(impl->get_file_information(
-      FileName, HandleFileInformation, DokanFileInfo));
+  lastErr = errno_to_ntstatus_error(impl->get_file_information(
+      FileName, HandleFileInformation, DokanFileInfo, &originalStat));
+  if (lastErr == 0) {
+    lastTime = now;
+    wcsncpy(lastName, FileName, MAX_PATH);
+    memcpy(lastInfo, HandleFileInformation, sizeof(*HandleFileInformation));
+  }
+
+  return lastErr;
 }
 
 static NTSTATUS DOKAN_CALLBACK FuseDeleteFile(LPCWSTR FileName,
@@ -325,7 +349,7 @@ static NTSTATUS DOKAN_CALLBACK FuseSetEndOfFile(
 }
 
 static NTSTATUS DOKAN_CALLBACK FuseSetAllocationSize(
-  LPCWSTR FileName, LONGLONG ByteOffset, PDOKAN_FILE_INFO DokanFileInfo) {
+    LPCWSTR FileName, LONGLONG ByteOffset, PDOKAN_FILE_INFO DokanFileInfo) {
   impl_fuse_context *impl = the_impl;
   if (impl->debug())
     FPRINTF(stderr, "SetAllocationSize: %ls, %lld\n", FileName, ByteOffset);
@@ -336,7 +360,7 @@ static NTSTATUS DOKAN_CALLBACK FuseSetAllocationSize(
   ZeroMemory(&byHandleFileInfo, sizeof(BY_HANDLE_FILE_INFORMATION));
 
   NTSTATUS ret = errno_to_ntstatus_error(
-      impl->get_file_information(FileName, &byHandleFileInfo, DokanFileInfo));
+      impl->get_file_information(FileName, &byHandleFileInfo, DokanFileInfo, NULL));
 
   LARGE_INTEGER fileSize;
   fileSize.LowPart = byHandleFileInfo.nFileSizeLow;
@@ -344,8 +368,7 @@ static NTSTATUS DOKAN_CALLBACK FuseSetAllocationSize(
 
   if (ret != 0) {
     return ret;
-  }
-  else if (ByteOffset < fileSize.QuadPart) {
+  } else if (ByteOffset < fileSize.QuadPart) {
     /* https://msdn.microsoft.com/en-us/library/windows/hardware/ff540232(v=vs.85).aspx
     * The end-of-file position must always be less than or equal to the
     * allocation size. If the allocation size is set to a value that is
@@ -353,8 +376,7 @@ static NTSTATUS DOKAN_CALLBACK FuseSetAllocationSize(
     * is automatically adjusted to match the allocation size.*/
     return errno_to_ntstatus_error(
         impl->set_end_of_file(FileName, ByteOffset, DokanFileInfo));
-  }
-  else {
+  } else {
     return 0;
   }
 }
@@ -447,7 +469,7 @@ FuseGetFileSecurity(LPCWSTR FileName, PSECURITY_INFORMATION SecurityInformation,
   {
     impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
     ret =
-        impl->get_file_information(FileName, &byHandleFileInfo, DokanFileInfo);
+        impl->get_file_information(FileName, &byHandleFileInfo, DokanFileInfo, NULL);
   }
 
   if (0 != ret) {
@@ -603,7 +625,8 @@ fuse_chan::~fuse_chan() {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////
-////// This are just "emulators" of native FUSE api for the sake of compatibility
+////// This are just "emulators" of native FUSE api for the sake of
+///compatibility
 ///////////////////////////////////////////////////////////////////////////////////////
 #define FUSE_LIB_OPT(t, p, v)                                                  \
   { t, offsetof(struct fuse_config, p), v }

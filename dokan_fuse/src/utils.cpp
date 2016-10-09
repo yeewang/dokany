@@ -1,10 +1,10 @@
 #define WIN32_NO_STATUS
 #include <windows.h>
 #undef WIN32_NO_STATUS
-#include <ntstatus.h>
-#include <errno.h>
-#include <sys/stat.h>
 #include "utils.h"
+#include <errno.h>
+#include <ntstatus.h>
+#include <sys/stat.h>
 
 typedef unsigned int ICONV_CHAR;
 
@@ -274,7 +274,7 @@ static const struct errentry errtable[] = {
     {STATUS_INVALID_ADDRESS, ENOMEM},       /* 9 */
     {STATUS_VARIABLE_NOT_FOUND, E2BIG},     /* 10 */
     //{  ERROR_BAD_FORMAT,             ENOEXEC   },  /* 11 */ Need to convert it
-    //to NTSTATUS
+    // to NTSTATUS
     //{  ERROR_INVALID_ACCESS,         EINVAL    },  /* 12 */
     //{  ERROR_INVALID_DATA,           EINVAL    },  /* 13 */
     //{  ERROR_INVALID_DRIVE,          ENOENT    },  /* 15 */
