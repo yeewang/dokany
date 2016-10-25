@@ -5,12 +5,13 @@
 #include "fuse.h"
 #include "utils.h"
 #include <string>
+#include <locale>
 #include <vector>
 #include <memory>
 #include <map>
 
 #define CHECKED(arg) if (0);else {int __res=arg; if (__res<0) return __res;}
-#define MAX_READ_SIZE (65536)
+#define MAX_READ_SIZE (65536 * 2)
 
 class impl_fuse_context;
 struct impl_chain_link;
@@ -30,6 +31,14 @@ public:
 	int get_file(const std::string &name, bool is_dir, DWORD access_mode, DWORD shared_mode, std::unique_ptr<impl_file_handle>& out);
 	void renamed_file(const std::string &name,const std::string &new_name);
 	void remove_file(const std::string& name);
+
+private:
+        const std::string toupper(const std::string& str) {
+             std::string new_str = str;
+             auto& f = std::use_facet<std::ctype<char>>(std::locale());
+             f.toupper(&new_str[0], &new_str[0] + new_str.size());
+             return new_str;
+        }
 };
 
 struct impl_chain_link

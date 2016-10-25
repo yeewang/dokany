@@ -16,6 +16,9 @@
 #include <mutex>
 #include <set>
 
+#include <strings.h>
+#include <algorithm>
+
 #include "fusemain.h"
 #include "utils.h"
 
@@ -524,26 +527,26 @@ int impl_fuse_context::cleanup(const std::string & file_name,
   close_file(file_name, dokan_file_info);
 
   for (iter = delete_on_close.rbegin(); iter != delete_on_close.rend(); ++iter) {
-	  const std::string &filename = (*iter).first;
+	  const std::string &itemName = (*iter).first;
 
 	  if (debug())
-		  FPRINTF(stderr, "delete_on_close: %s, DeleteOnClose: %d\n", filename.c_str(),
+		  FPRINTF(stderr, "delete_on_close: %s, DeleteOnClose: %d\n", itemName.c_str(),
 					  dokan_file_info->DeleteOnClose);
 
-	  if (filename.compare(0, file_name.size(), file_name) == 0) {
-		  if (filename.size() > file_name.size()) {
-			  if (filename[file_name.size()] != '/')
+	  if (strncasecmp(itemName.c_str(), file_name.c_str(), file_name.size()) == 0) {
+		  if (itemName.size() > file_name.size()) {
+			  if (itemName[file_name.size()] != '/')
 				  continue;
 		  }
 
 		  if (debug())
 			  FPRINTF(stderr, "Delete the %s: %s\n",
-					  (*iter).second ? "directory" : "file", filename.c_str());
+					  (*iter).second ? "directory" : "file", itemName.c_str());
 
 		  if ((*iter).second) {
-			  do_delete_directory(filename, dokan_file_info);
+			  do_delete_directory(itemName, dokan_file_info);
 		  } else {
-			  do_delete_file(filename, dokan_file_info);
+			  do_delete_file(itemName, dokan_file_info);
 		  }
 
 		  delete_on_close.erase(std::next(iter).base());
@@ -1090,14 +1093,16 @@ int impl_file_locks::get_file(const std::string &name, bool is_dir,
 
   // check previous files with same names
   impl_file_lock *lock, *old_lock = NULL;
+  std::string cname = toupper(name);
+
   EnterCriticalSection(&this->lock);
-  file_locks_t::iterator i = file_locks.find(name);
+  file_locks_t::iterator i = file_locks.find(cname);
   if (i != file_locks.end()) {
     old_lock = lock = i->second;
     EnterCriticalSection(&lock->lock);
   } else {
     lock = new impl_file_lock(this, name);
-    file_locks[name] = lock;
+    file_locks[cname] = lock;
     lock->add_file_unlocked(file.get());
   }
   file->file_lock = lock;
@@ -1150,8 +1155,10 @@ void impl_file_lock::remove_file(impl_file_handle *file) {
 }
 
 void impl_file_locks::remove_file(const std::string &name) {
+  std::string cname = toupper(name);
+
   EnterCriticalSection(&lock);
-  file_locks_t::iterator i = file_locks.find(name);
+  file_locks_t::iterator i = file_locks.find(cname);
   if (i != file_locks.end() && !i->second->first) {
     if (i->second)
       delete i->second;
@@ -1165,16 +1172,19 @@ void impl_file_locks::renamed_file(const std::string &name,
   if (name == new_name)
     return;
 
+  std::string cname = toupper(name);
+  std::string ncname = toupper(new_name);
+
   EnterCriticalSection(&lock);
   // TODO what happen if new_name exists ??
-  file_locks_t::iterator i = file_locks.find(name);
+  file_locks_t::iterator i = file_locks.find(cname);
   if (i != file_locks.end()) {
     impl_file_lock *lock = i->second;
     EnterCriticalSection(&lock->lock);
     lock->name_ = new_name;
     LeaveCriticalSection(&lock->lock);
-    file_locks[new_name] = lock;
-    file_locks.erase(i);
+	file_locks.erase(i);
+    file_locks[ncname] = lock;
   }
   LeaveCriticalSection(&lock);
 }
@@ -1243,7 +1253,10 @@ impl_file_handle::impl_file_handle(bool is_dir, DWORD shared_mode)
     : is_dir_(is_dir), fh_(-1), next_file(NULL), file_lock(NULL),
       shared_mode_(shared_mode) {}
 
-impl_file_handle::~impl_file_handle() { file_lock->remove_file(this); }
+impl_file_handle::~impl_file_handle() {
+	if (file_lock)
+		file_lock->remove_file(this);
+}
 
 int impl_file_handle::close(const struct fuse_operations *ops) {
   int flush_err = 0;
